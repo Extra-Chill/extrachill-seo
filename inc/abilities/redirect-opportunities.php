@@ -44,6 +44,13 @@ if ( ! defined( 'ABSPATH' ) ) {
  * Maps the human search phrase => the URL scope slug used by the events
  * discovery rewrite (extrachill-events EXTRACHILL_EVENTS_DISCOVERY_SCOPES).
  *
+ * "today" is intentionally omitted: extrachill-events treats it as the same
+ * intent as "tonight" (its discovery sitemap excludes "today" for that exact
+ * reason), so proposing a separate /...-today redirect would only compete with
+ * /...-tonight for the same destination. A "live music in {city} today" query
+ * therefore folds into the unscoped or tonight opportunity rather than a
+ * distinct one.
+ *
  * @return array<string, string>
  */
 function ec_seo_opportunity_scopes() {
@@ -51,7 +58,6 @@ function ec_seo_opportunity_scopes() {
 		'this weekend' => 'this-weekend',
 		'this week'    => 'this-week',
 		'tonight'      => 'tonight',
-		'today'        => 'today',
 	);
 }
 
@@ -104,7 +110,7 @@ function register_redirect_opportunity_ability() {
 			),
 			'execute_callback'    => __NAMESPACE__ . '\\execute_redirect_opportunities',
 			'permission_callback' => function () {
-				return current_user_can( 'manage_options' );
+				return current_user_can( 'manage_options' ) || ( defined( 'WP_CLI' ) && WP_CLI );
 			},
 			'meta'                => array(
 				'show_in_rest' => false,
@@ -154,11 +160,12 @@ function execute_redirect_opportunities( $input ) {
 	}
 
 	$skipped = array(
-		'below_min_impressions' => 0,
-		'no_city_parsed'        => 0,
-		'no_location_term'      => 0,
-		'destination_not_200'   => 0,
-		'rule_exists'           => 0,
+		'below_min_impressions'   => 0,
+		'no_city_parsed'          => 0,
+		'no_location_term'        => 0,
+		'ambiguous_city_no_state' => 0,
+		'destination_not_200'     => 0,
+		'rule_exists'             => 0,
 	);
 
 	// 2-6. Aggregate by city+scope, resolve destination, verify, dedupe, rank.
@@ -207,9 +214,17 @@ function execute_redirect_opportunities( $input ) {
 		}
 
 		// 3. Resolve the events location archive destination for this city.
+		// City slugs are not globally unique under the hierarchical location
+		// taxonomy: a state hint disambiguates, and an ambiguous slug with no
+		// hint is skipped (honest over a silent wrong-state proposal).
 		$destination = ec_seo_resolve_location_destination( $target['city'], $target['scope'], $target['state'] );
 
-		if ( empty( $destination['url'] ) ) {
+		if ( 'ambiguous' === $destination['status'] ) {
+			++$skipped['ambiguous_city_no_state'];
+			continue;
+		}
+
+		if ( 'ok' !== $destination['status'] || empty( $destination['url'] ) ) {
 			++$skipped['no_location_term'];
 			continue;
 		}
@@ -423,14 +438,27 @@ function ec_seo_parse_live_music_query( $query ) {
  * derives the state abbreviation from the term's parent (used to build the
  * legacy source URL, mirroring the Charleston "-sc-" pattern).
  *
+ * The `location` taxonomy is HIERARCHICAL (usa > {state} > {city}) and city
+ * slugs are NOT globally unique (Portland OR vs Portland ME; Springfield
+ * IL/MO/MA; Columbia SC/MO). A bare slug lookup can therefore silently resolve
+ * to the wrong state. To stay honest:
+ *   - When a state hint is present, the city term is constrained to the child
+ *     of that state term (resolve state under usa first, then the city child).
+ *   - When NO state hint is present and the slug is ambiguous (multiple
+ *     matching terms), the candidate is SKIPPED rather than guessed — the
+ *     caller is told via the 'ambiguous' status.
+ *
  * @param string $city_phrase City phrase (e.g. "little rock").
  * @param string $scope       Scope slug ('' for the unscoped archive).
  * @param string $state_hint  Optional two-letter state abbr parsed from the
- *                            query, used when the term ancestry yields none.
- * @return array{url:string, city_slug:string, city_name:string, state_abbr:string}
+ *                            query, used to disambiguate the city-term lookup
+ *                            and to build the legacy URL.
+ * @return array{status:string, url:string, city_slug:string, city_name:string, state_abbr:string}
+ *         status is one of 'ok', 'not_found', or 'ambiguous'.
  */
 function ec_seo_resolve_location_destination( $city_phrase, $scope, $state_hint = '' ) {
 	$empty = array(
+		'status'     => 'not_found',
 		'url'        => '',
 		'city_slug'  => '',
 		'city_name'  => '',
@@ -455,9 +483,12 @@ function ec_seo_resolve_location_destination( $city_phrase, $scope, $state_hint 
 
 	$result = $empty;
 
-	$term = get_term_by( 'slug', $city_slug, 'location' );
+	// Resolve the candidate city term(s), disambiguating by state hint.
+	$term = ec_seo_select_city_term( $city_slug, $state_hint );
 
-	if ( $term && ! is_wp_error( $term ) ) {
+	if ( 'ambiguous' === $term ) {
+		$result = array_merge( $empty, array( 'status' => 'ambiguous' ) );
+	} elseif ( $term instanceof \WP_Term ) {
 		$term_link = get_term_link( $term );
 
 		if ( ! is_wp_error( $term_link ) ) {
@@ -471,6 +502,7 @@ function ec_seo_resolve_location_destination( $city_phrase, $scope, $state_hint 
 			}
 
 			$result = array(
+				'status'     => 'ok',
 				'url'        => $url,
 				'city_slug'  => $term->slug,
 				'city_name'  => $term->name,
@@ -484,6 +516,95 @@ function ec_seo_resolve_location_destination( $city_phrase, $scope, $state_hint 
 	}
 
 	return $result;
+}
+
+/**
+ * Select the single correct city `location` term for a slug, disambiguating
+ * by state when the slug is not globally unique.
+ *
+ * Must be called inside the events-site blog context.
+ *
+ *   - State hint present: resolve the state term (child of usa), then return
+ *     the city term whose parent is that state. No match under that state =>
+ *     not found (null), never a different-state term.
+ *   - No state hint: return the term if exactly one matches; if multiple
+ *     terms share the slug, return the sentinel string 'ambiguous' so the
+ *     caller skips it instead of guessing.
+ *
+ * @param string $city_slug  Sanitized city slug (e.g. "portland").
+ * @param string $state_hint Two-letter state abbr, or '' when absent.
+ * @return \WP_Term|string|null Term on success, 'ambiguous' sentinel, or null.
+ */
+function ec_seo_select_city_term( $city_slug, $state_hint ) {
+	if ( '' !== $state_hint ) {
+		$state_slug = ec_seo_state_slug_for_abbr( $state_hint );
+		if ( '' === $state_slug ) {
+			return null;
+		}
+
+		$usa    = get_term_by( 'slug', 'usa', 'location' );
+		$usa_id = ( $usa && ! is_wp_error( $usa ) ) ? (int) $usa->term_id : 0;
+
+		$state_terms = get_terms(
+			array(
+				'taxonomy'   => 'location',
+				'slug'       => $state_slug,
+				'hide_empty' => false,
+				'parent'     => $usa_id,
+			)
+		);
+
+		if ( is_wp_error( $state_terms ) || empty( $state_terms ) ) {
+			return null;
+		}
+
+		$state_term = $state_terms[0];
+
+		$city_terms = get_terms(
+			array(
+				'taxonomy'   => 'location',
+				'slug'       => $city_slug,
+				'hide_empty' => false,
+				'parent'     => (int) $state_term->term_id,
+			)
+		);
+
+		if ( is_wp_error( $city_terms ) || empty( $city_terms ) ) {
+			return null;
+		}
+
+		return $city_terms[0];
+	}
+
+	// No state hint — only safe when the slug maps to exactly one term.
+	$matches = get_terms(
+		array(
+			'taxonomy'   => 'location',
+			'slug'       => $city_slug,
+			'hide_empty' => false,
+		)
+	);
+
+	if ( is_wp_error( $matches ) || empty( $matches ) ) {
+		return null;
+	}
+
+	if ( count( $matches ) > 1 ) {
+		return 'ambiguous';
+	}
+
+	return $matches[0];
+}
+
+/**
+ * Map a two-letter state abbreviation back to its taxonomy state slug.
+ *
+ * @param string $abbr Two-letter state abbreviation (lowercase).
+ * @return string State slug (e.g. "maine") or '' when unknown.
+ */
+function ec_seo_state_slug_for_abbr( $abbr ) {
+	$slug = array_search( strtolower( $abbr ), ec_seo_state_abbreviations(), true );
+	return false === $slug ? '' : $slug;
 }
 
 /**
