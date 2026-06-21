@@ -236,8 +236,10 @@ function execute_redirect_opportunities( $input ) {
 		}
 
 		// 5. Build the templated legacy source URL and skip if a rule exists.
+		// Uses the suffix-free city-name slug so a suffixed term (portland-me)
+		// produces /live-music-in-portland-me-... not -portland-me-me-...
 		$legacy_url = ec_seo_build_legacy_url(
-			$destination['city_slug'],
+			$destination['city_base_slug'],
 			$destination['state_abbr'],
 			$target['scope']
 		);
@@ -453,16 +455,20 @@ function ec_seo_parse_live_music_query( $query ) {
  * @param string $state_hint  Optional two-letter state abbr parsed from the
  *                            query, used to disambiguate the city-term lookup
  *                            and to build the legacy URL.
- * @return array{status:string, url:string, city_slug:string, city_name:string, state_abbr:string}
- *         status is one of 'ok', 'not_found', or 'ambiguous'.
+ * @return array{status:string, url:string, city_slug:string, city_base_slug:string, city_name:string, state_abbr:string}
+ *         status is one of 'ok', 'not_found', or 'ambiguous'. city_slug is the
+ *         term's real (possibly suffixed) slug used in the destination URL;
+ *         city_base_slug is the suffix-free city-name slug used to build the
+ *         templated legacy source URL.
  */
 function ec_seo_resolve_location_destination( $city_phrase, $scope, $state_hint = '' ) {
 	$empty = array(
-		'status'     => 'not_found',
-		'url'        => '',
-		'city_slug'  => '',
-		'city_name'  => '',
-		'state_abbr' => '',
+		'status'         => 'not_found',
+		'url'            => '',
+		'city_slug'      => '',
+		'city_base_slug' => '',
+		'city_name'      => '',
+		'state_abbr'     => '',
 	);
 
 	$events_blog_id = function_exists( 'ec_get_blog_id' ) ? (int) ec_get_blog_id( 'events' ) : 7;
@@ -470,8 +476,7 @@ function ec_seo_resolve_location_destination( $city_phrase, $scope, $state_hint 
 		return $empty;
 	}
 
-	$city_slug = sanitize_title( $city_phrase );
-	if ( '' === $city_slug ) {
+	if ( '' === sanitize_title( $city_phrase ) ) {
 		return $empty;
 	}
 
@@ -484,7 +489,7 @@ function ec_seo_resolve_location_destination( $city_phrase, $scope, $state_hint 
 	$result = $empty;
 
 	// Resolve the candidate city term(s), disambiguating by state hint.
-	$term = ec_seo_select_city_term( $city_slug, $state_hint );
+	$term = ec_seo_select_city_term( $city_phrase, $state_hint );
 
 	if ( 'ambiguous' === $term ) {
 		$result = array_merge( $empty, array( 'status' => 'ambiguous' ) );
@@ -502,11 +507,15 @@ function ec_seo_resolve_location_destination( $city_phrase, $scope, $state_hint 
 			}
 
 			$result = array(
-				'status'     => 'ok',
-				'url'        => $url,
-				'city_slug'  => $term->slug,
-				'city_name'  => $term->name,
-				'state_abbr' => $state_abbr,
+				'status'         => 'ok',
+				'url'            => $url,
+				'city_slug'      => $term->slug,
+				// Suffix-free slug from the term NAME for the legacy URL, so a
+				// suffixed term (portland-me) still yields a clean
+				// /live-music-in-portland-me-... source, not -portland-me-me-.
+				'city_base_slug' => sanitize_title( $term->name ),
+				'city_name'      => $term->name,
+				'state_abbr'     => $state_abbr,
 			);
 		}
 	}
@@ -519,81 +528,157 @@ function ec_seo_resolve_location_destination( $city_phrase, $scope, $state_hint 
 }
 
 /**
- * Select the single correct city `location` term for a slug, disambiguating
- * by state when the slug is not globally unique.
+ * Select the single correct city `location` term for a parsed city phrase,
+ * disambiguating by state when the city name is not unique across states.
  *
  * Must be called inside the events-site blog context.
  *
- *   - State hint present: resolve the state term (child of usa), then return
- *     the city term whose parent is that state. No match under that state =>
- *     not found (null), never a different-state term.
- *   - No state hint: return the term if exactly one matches; if multiple
- *     terms share the slug, return the sentinel string 'ambiguous' so the
- *     caller skips it instead of guessing.
+ * WordPress enforces unique slugs within a taxonomy, so a second same-named
+ * city in another state gets a SUFFIXED slug — Portland OR is "portland" but
+ * Portland ME is "portland-me", Charleston SC is "charleston" but Charleston
+ * WV is "charleston-wv". The canonical city slug is therefore unknowable from
+ * query text. Matching must be on the city term NAME (normalized), scoped to
+ * the resolved state, not on a guessed slug.
  *
- * @param string $city_slug  Sanitized city slug (e.g. "portland").
- * @param string $state_hint Two-letter state abbr, or '' when absent.
+ *   - State hint present: resolve the state term (child of usa), then return
+ *     the child whose normalized name matches the parsed city. No match under
+ *     that state => null (never a different-state term).
+ *   - No state hint: real ambiguity is a city name appearing under MULTIPLE
+ *     states. Scan every state's children for the name; if more than one state
+ *     has it, return the 'ambiguous' sentinel (caller skips honestly); if
+ *     exactly one does, return it; none => null.
+ *
+ * @param string $city_phrase City phrase from the query (e.g. "portland").
+ * @param string $state_hint  Two-letter state abbr, or '' when absent.
  * @return \WP_Term|string|null Term on success, 'ambiguous' sentinel, or null.
  */
-function ec_seo_select_city_term( $city_slug, $state_hint ) {
-	if ( '' !== $state_hint ) {
-		$state_slug = ec_seo_state_slug_for_abbr( $state_hint );
-		if ( '' === $state_slug ) {
-			return null;
-		}
-
-		$usa    = get_term_by( 'slug', 'usa', 'location' );
-		$usa_id = ( $usa && ! is_wp_error( $usa ) ) ? (int) $usa->term_id : 0;
-
-		$state_terms = get_terms(
-			array(
-				'taxonomy'   => 'location',
-				'slug'       => $state_slug,
-				'hide_empty' => false,
-				'parent'     => $usa_id,
-			)
-		);
-
-		if ( is_wp_error( $state_terms ) || empty( $state_terms ) ) {
-			return null;
-		}
-
-		$state_term = $state_terms[0];
-
-		$city_terms = get_terms(
-			array(
-				'taxonomy'   => 'location',
-				'slug'       => $city_slug,
-				'hide_empty' => false,
-				'parent'     => (int) $state_term->term_id,
-			)
-		);
-
-		if ( is_wp_error( $city_terms ) || empty( $city_terms ) ) {
-			return null;
-		}
-
-		return $city_terms[0];
-	}
-
-	// No state hint — only safe when the slug maps to exactly one term.
-	$matches = get_terms(
-		array(
-			'taxonomy'   => 'location',
-			'slug'       => $city_slug,
-			'hide_empty' => false,
-		)
-	);
-
-	if ( is_wp_error( $matches ) || empty( $matches ) ) {
+function ec_seo_select_city_term( $city_phrase, $state_hint ) {
+	$target_name = sanitize_title( $city_phrase );
+	if ( '' === $target_name ) {
 		return null;
 	}
 
-	if ( count( $matches ) > 1 ) {
+	if ( '' !== $state_hint ) {
+		$state_term = ec_seo_state_term_for_abbr( $state_hint );
+		if ( ! $state_term ) {
+			return null;
+		}
+
+		$child = ec_seo_city_child_by_name( (int) $state_term->term_id, $target_name );
+		if ( $child instanceof \WP_Term ) {
+			return $child;
+		}
+
+		// City-is-state-level case (e.g. Washington, D.C.): the destination is
+		// the abbr's own usa-level leaf (no city children). Match when the
+		// state term's normalized name equals the parsed city, or begins with
+		// it (so "washington" resolves "washington-d-c" / "Washington, D.C.").
+		$state_name_slug = sanitize_title( $state_term->name );
+		if ( $state_name_slug === $target_name
+			|| 0 === strpos( $state_name_slug, $target_name . '-' ) ) {
+			return $state_term;
+		}
+
+		return null;
+	}
+
+	// No state hint — detect real ambiguity by NAME across all state terms.
+	$usa    = get_term_by( 'slug', 'usa', 'location' );
+	$usa_id = ( $usa && ! is_wp_error( $usa ) ) ? (int) $usa->term_id : 0;
+
+	$states = get_terms(
+		array(
+			'taxonomy'   => 'location',
+			'hide_empty' => false,
+			'parent'     => $usa_id,
+		)
+	);
+
+	if ( is_wp_error( $states ) || empty( $states ) ) {
+		return null;
+	}
+
+	$found = array();
+	foreach ( $states as $state ) {
+		$child = ec_seo_city_child_by_name( (int) $state->term_id, $target_name );
+		if ( $child instanceof \WP_Term ) {
+			$found[] = $child;
+		}
+	}
+
+	if ( empty( $found ) ) {
+		return null;
+	}
+
+	if ( count( $found ) > 1 ) {
 		return 'ambiguous';
 	}
 
-	return $matches[0];
+	return $found[0];
+}
+
+/**
+ * Resolve a US state `location` term (direct child of usa) by its two-letter
+ * abbreviation. Must run inside the events-site blog context.
+ *
+ * @param string $state_abbr Two-letter state abbreviation (lowercase).
+ * @return \WP_Term|null State term or null.
+ */
+function ec_seo_state_term_for_abbr( $state_abbr ) {
+	$state_slug = ec_seo_state_slug_for_abbr( $state_abbr );
+	if ( '' === $state_slug ) {
+		return null;
+	}
+
+	$usa    = get_term_by( 'slug', 'usa', 'location' );
+	$usa_id = ( $usa && ! is_wp_error( $usa ) ) ? (int) $usa->term_id : 0;
+
+	$state_terms = get_terms(
+		array(
+			'taxonomy'   => 'location',
+			'slug'       => $state_slug,
+			'hide_empty' => false,
+			'parent'     => $usa_id,
+		)
+	);
+
+	if ( is_wp_error( $state_terms ) || empty( $state_terms ) ) {
+		return null;
+	}
+
+	return $state_terms[0];
+}
+
+/**
+ * Find the child `location` term of a state whose normalized name matches the
+ * target city. Matches on sanitize_title( name ) so it survives suffixed slugs
+ * (e.g. "portland-me" still has name "Portland"). Must run inside the
+ * events-site blog context.
+ *
+ * @param int    $state_term_id Parent state term ID.
+ * @param string $target_name   sanitize_title()-normalized city name.
+ * @return \WP_Term|null Matching city term or null.
+ */
+function ec_seo_city_child_by_name( $state_term_id, $target_name ) {
+	$children = get_terms(
+		array(
+			'taxonomy'   => 'location',
+			'hide_empty' => false,
+			'parent'     => $state_term_id,
+		)
+	);
+
+	if ( is_wp_error( $children ) || empty( $children ) ) {
+		return null;
+	}
+
+	foreach ( $children as $child ) {
+		if ( sanitize_title( $child->name ) === $target_name ) {
+			return $child;
+		}
+	}
+
+	return null;
 }
 
 /**
@@ -701,56 +786,57 @@ function ec_seo_destination_returns_200( $url ) {
  */
 function ec_seo_state_abbreviations() {
 	return array(
-		'alabama'              => 'al',
-		'alaska'               => 'ak',
-		'arizona'              => 'az',
-		'arkansas'             => 'ar',
-		'california'           => 'ca',
-		'colorado'             => 'co',
-		'connecticut'          => 'ct',
-		'delaware'             => 'de',
-		'florida'              => 'fl',
-		'georgia'              => 'ga',
-		'hawaii'               => 'hi',
-		'idaho'                => 'id',
-		'illinois'             => 'il',
-		'indiana'              => 'in',
-		'iowa'                 => 'ia',
-		'kansas'               => 'ks',
-		'kentucky'             => 'ky',
-		'louisiana'            => 'la',
-		'maine'                => 'me',
-		'maryland'             => 'md',
-		'massachusetts'        => 'ma',
-		'michigan'             => 'mi',
-		'minnesota'            => 'mn',
-		'mississippi'          => 'ms',
-		'missouri'             => 'mo',
-		'montana'              => 'mt',
-		'nebraska'             => 'ne',
-		'nevada'               => 'nv',
-		'new-hampshire'        => 'nh',
-		'new-jersey'           => 'nj',
-		'new-mexico'           => 'nm',
-		'new-york'             => 'ny',
-		'north-carolina'       => 'nc',
-		'north-dakota'         => 'nd',
-		'ohio'                 => 'oh',
-		'oklahoma'             => 'ok',
-		'oregon'               => 'or',
-		'pennsylvania'         => 'pa',
-		'rhode-island'         => 'ri',
-		'south-carolina'       => 'sc',
-		'south-dakota'         => 'sd',
-		'tennessee'            => 'tn',
-		'texas'                => 'tx',
-		'utah'                 => 'ut',
-		'vermont'              => 'vt',
-		'virginia'             => 'va',
-		'washington'           => 'wa',
-		'west-virginia'        => 'wv',
-		'wisconsin'            => 'wi',
-		'wyoming'              => 'wy',
-		'district-of-columbia' => 'dc',
+		'alabama'        => 'al',
+		'alaska'         => 'ak',
+		'arizona'        => 'az',
+		'arkansas'       => 'ar',
+		'california'     => 'ca',
+		'colorado'       => 'co',
+		'connecticut'    => 'ct',
+		'delaware'       => 'de',
+		'florida'        => 'fl',
+		'georgia'        => 'ga',
+		'hawaii'         => 'hi',
+		'idaho'          => 'id',
+		'illinois'       => 'il',
+		'indiana'        => 'in',
+		'iowa'           => 'ia',
+		'kansas'         => 'ks',
+		'kentucky'       => 'ky',
+		'louisiana'      => 'la',
+		'maine'          => 'me',
+		'maryland'       => 'md',
+		'massachusetts'  => 'ma',
+		'michigan'       => 'mi',
+		'minnesota'      => 'mn',
+		'mississippi'    => 'ms',
+		'missouri'       => 'mo',
+		'montana'        => 'mt',
+		'nebraska'       => 'ne',
+		'nevada'         => 'nv',
+		'new-hampshire'  => 'nh',
+		'new-jersey'     => 'nj',
+		'new-mexico'     => 'nm',
+		'new-york'       => 'ny',
+		'north-carolina' => 'nc',
+		'north-dakota'   => 'nd',
+		'ohio'           => 'oh',
+		'oklahoma'       => 'ok',
+		'oregon'         => 'or',
+		'pennsylvania'   => 'pa',
+		'rhode-island'   => 'ri',
+		'south-carolina' => 'sc',
+		'south-dakota'   => 'sd',
+		'tennessee'      => 'tn',
+		'texas'          => 'tx',
+		'utah'           => 'ut',
+		'vermont'        => 'vt',
+		'virginia'       => 'va',
+		'washington'     => 'wa',
+		'west-virginia'  => 'wv',
+		'wisconsin'      => 'wi',
+		'wyoming'        => 'wy',
+		// Live taxonomy uses "washington-d-c" for the District of Columbia.
+		'washington-d-c' => 'dc',
 	);
 }
