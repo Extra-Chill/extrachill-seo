@@ -10,7 +10,7 @@
  * This is the data-first, templated generalization of the one hand-built
  * Charleston rule (redirect rule #250):
  *   /live-music-in-charleston-sc-this-week
- *     -> https://events.extrachill.com/location/usa/south-carolina/charleston/this-week
+ *     -> https://events.extrachill.com/location/usa/south-carolina/charleston/this-week/
  *
  * Method:
  *   1. Pull "live music in ..." query demand from Google Search Console
@@ -497,7 +497,7 @@ function ec_seo_resolve_location_destination( $city_phrase, $scope, $state_hint 
 		$term_link = get_term_link( $term );
 
 		if ( ! is_wp_error( $term_link ) ) {
-			$url = $scope ? trailingslashit( $term_link ) . $scope : $term_link;
+			$url = $scope ? trailingslashit( trailingslashit( $term_link ) . $scope ) : $term_link;
 
 			// Prefer the state from the term's ancestor chain (authoritative);
 			// fall back to the state parsed from the query.
