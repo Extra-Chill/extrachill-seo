@@ -23,6 +23,10 @@ use WP_Post;
 use function ExtraChill\SEO\Schema\ec_seo_build_event_schema;
 use function ExtraChill\SEO\Schema\ec_seo_compute_offer_url;
 use function ExtraChill\SEO\Schema\ec_seo_resolve_offer_url;
+use const ExtraChill\SEO\Schema\RESOLUTION_FALLBACK_HELPERS_UNAVAILABLE;
+use const ExtraChill\SEO\Schema\RESOLUTION_FALLBACK_UNPARSEABLE;
+use const ExtraChill\SEO\Schema\RESOLUTION_PASSTHROUGH;
+use const ExtraChill\SEO\Schema\RESOLUTION_VENDOR_URL;
 
 final class SchemaEventOfferUrlTest extends TestCase {
 
@@ -67,7 +71,8 @@ final class SchemaEventOfferUrlTest extends TestCase {
 			fn( $url ) => self::VENDOR_URL
 		);
 
-		$this->assertSame( self::VENDOR_URL, $resolved );
+		$this->assertSame( self::VENDOR_URL, $resolved['url'] );
+		$this->assertSame( RESOLUTION_VENDOR_URL, $resolved['resolution'] );
 	}
 
 	public function test_unparseable_affiliate_url_resolves_to_permalink(): void {
@@ -79,13 +84,15 @@ final class SchemaEventOfferUrlTest extends TestCase {
 			fn( $url ) => $url
 		);
 
-		$this->assertSame( self::PERMALINK, $resolved );
+		$this->assertSame( self::PERMALINK, $resolved['url'] );
+		$this->assertSame( RESOLUTION_FALLBACK_UNPARSEABLE, $resolved['resolution'] );
 	}
 
 	public function test_helpers_absent_resolves_to_permalink(): void {
 		$resolved = ec_seo_compute_offer_url( self::WRAPPER_URL, self::PERMALINK, null, null );
 
-		$this->assertSame( self::PERMALINK, $resolved );
+		$this->assertSame( self::PERMALINK, $resolved['url'] );
+		$this->assertSame( RESOLUTION_FALLBACK_HELPERS_UNAVAILABLE, $resolved['resolution'] );
 	}
 
 	public function test_unwrapper_absent_resolves_to_permalink_for_affiliate_url(): void {
@@ -96,7 +103,8 @@ final class SchemaEventOfferUrlTest extends TestCase {
 			null
 		);
 
-		$this->assertSame( self::PERMALINK, $resolved );
+		$this->assertSame( self::PERMALINK, $resolved['url'] );
+		$this->assertSame( RESOLUTION_FALLBACK_HELPERS_UNAVAILABLE, $resolved['resolution'] );
 	}
 
 	public function test_non_affiliate_url_passes_through_unchanged(): void {
@@ -108,7 +116,8 @@ final class SchemaEventOfferUrlTest extends TestCase {
 			fn( $url ) => self::fail( 'Unwrapper must not be consulted for non-affiliate URLs' )
 		);
 
-		$this->assertSame( $direct, $resolved );
+		$this->assertSame( $direct, $resolved['url'] );
+		$this->assertSame( RESOLUTION_PASSTHROUGH, $resolved['resolution'] );
 	}
 
 	// ---- production wrapper ----
