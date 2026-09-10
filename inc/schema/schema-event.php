@@ -175,6 +175,81 @@ function ec_seo_parse_event_price( string $price ): array {
 }
 
 /**
+ * Compute the URL to emit as the Event offers.url.
+ *
+ * Pure resolution step with the domain helpers injected so every branch is
+ * unit-testable, including the helpers-absent fallback. Behavior:
+ *
+ * - Helpers unavailable (data-machine-events not loaded yet): return the
+ *   fallback. Affiliate wrappers cannot be detected safely, so the raw
+ *   ticket URL is never published.
+ * - Not an affiliate URL: pass through unchanged.
+ * - Affiliate URL that unwraps to a different URL: return the de-affiliated
+ *   vendor destination.
+ * - Affiliate URL that cannot be unwrapped (parser returns it unchanged):
+ *   return the fallback.
+ *
+ * @param string        $ticket_url   Raw ticket URL from the event-details block.
+ * @param string        $fallback_url Event permalink used when the ticket URL
+ *                                    cannot be safely published.
+ * @param callable|null $is_affiliate `data_machine_events_is_affiliate_ticket_url()`
+ *                                    when available, null otherwise.
+ * @param callable|null $unwrap       `datamachine_unwrap_affiliate_url()` when
+ *                                    available, null otherwise.
+ * @return string URL safe to emit as offers.url.
+ */
+function ec_seo_compute_offer_url( string $ticket_url, string $fallback_url, ?callable $is_affiliate, ?callable $unwrap ): string {
+	if ( null === $is_affiliate || null === $unwrap ) {
+		return $fallback_url;
+	}
+
+	if ( ! $is_affiliate( $ticket_url ) ) {
+		return $ticket_url;
+	}
+
+	$unwrapped = $unwrap( $ticket_url );
+
+	if ( '' !== $unwrapped && $unwrapped !== $ticket_url ) {
+		return $unwrapped;
+	}
+
+	return $fallback_url;
+}
+
+/**
+ * Resolve the URL to emit as the Event offers.url for a ticket URL.
+ *
+ * Ticket URLs stored on events may be affiliate wrappers that carry the real
+ * vendor destination behind a redirect. Publishing those wrappers in
+ * structured data puts an affiliate-tracking URL into raw, machine-readable
+ * HTML, which our ticketing affiliate agreements prohibit.
+ *
+ * Affiliate detection and unwrapping belong to the events domain layer
+ * (data-machine-events). This SEO layer only asks whether a URL is
+ * affiliate-wrapped and requests its de-affiliated destination; no affiliate
+ * host names or wrapper parsing live here. When the domain helpers are
+ * unavailable (plugin load ordering), the event permalink is emitted instead
+ * — a valid offers.url — and the raw ticket URL is never published.
+ *
+ * @param string $ticket_url   Raw ticket URL from the event-details block.
+ * @param string $fallback_url Event permalink used when the ticket URL
+ *                             cannot be safely published.
+ * @return string URL safe to emit as offers.url.
+ *
+ * @see https://github.com/Extra-Chill/extrachill-seo/issues/57
+ */
+function ec_seo_resolve_offer_url( string $ticket_url, string $fallback_url ): string {
+	$is_affiliate = function_exists( 'data_machine_events_is_affiliate_ticket_url' )
+		? 'data_machine_events_is_affiliate_ticket_url'
+		: null;
+	$unwrap       = function_exists( 'datamachine_unwrap_affiliate_url' )
+		? 'datamachine_unwrap_affiliate_url'
+		: null;
+
+	return ec_seo_compute_offer_url( $ticket_url, $fallback_url, $is_affiliate, $unwrap );
+}
+
+/**
  * Build the Event schema entity for a single event post.
  *
  * @param \WP_Post $post  Event post.
@@ -357,7 +432,7 @@ function ec_seo_build_event_schema( \WP_Post $post, array $attrs ): ?array {
 		}
 
 		if ( '' !== $ticket_url ) {
-			$offers['url'] = esc_url_raw( $ticket_url );
+			$offers['url'] = esc_url_raw( ec_seo_resolve_offer_url( $ticket_url, $permalink ) );
 		}
 
 		$schema['offers'] = $offers;

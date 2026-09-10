@@ -236,6 +236,7 @@ if ( ! class_exists( 'WP_Term' ) ) {
 require_once __DIR__ . '/Support/MiniBlockParser.php';
 require_once __DIR__ . '/Support/TermRegistry.php';
 require_once __DIR__ . '/Support/VenueDataRegistry.php';
+require_once __DIR__ . '/Support/TicketUrlRegistry.php';
 
 if ( ! function_exists( 'data_machine_events_get_venue_data' ) ) {
 	function data_machine_events_get_venue_data( int $term_id ): ?array {
@@ -243,10 +244,23 @@ if ( ! function_exists( 'data_machine_events_get_venue_data' ) ) {
 	}
 }
 
+if ( ! function_exists( 'data_machine_events_is_affiliate_ticket_url' ) ) {
+	function data_machine_events_is_affiliate_ticket_url( string $url ): bool {
+		return \ExtraChill\SEO\Tests\Support\TicketUrlRegistry::is_affiliate( $url );
+	}
+}
+
+if ( ! function_exists( 'datamachine_unwrap_affiliate_url' ) ) {
+	function datamachine_unwrap_affiliate_url( string $url ): string {
+		return \ExtraChill\SEO\Tests\Support\TicketUrlRegistry::unwrap( $url );
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Load the schema module under test.
 // ---------------------------------------------------------------------------
 
+require_once __DIR__ . '/../inc/schema/schema-helpers.php';
 require_once __DIR__ . '/../inc/schema/schema-event.php';
 require_once __DIR__ . '/../inc/core/canonical.php';
 require_once __DIR__ . '/../inc/core/open-graph.php';
